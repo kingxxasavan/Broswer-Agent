@@ -24,9 +24,6 @@ go to google, search for lofi music, click the first youtube result
 # 1. Install dependencies
 pip install -r requirements.txt
 
-# 2. Install Playwright browsers
-playwright install chromium
-
 # 3. Make sure Ollama is running (for local mode)
 ollama pull qwen3:4b
 
