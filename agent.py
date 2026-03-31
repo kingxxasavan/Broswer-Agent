@@ -1,486 +1,294 @@
 """
-browser.py — Dual-mode browser control
-
-MODE 1 — CDP (Playwright):
-  Chrome was launched with --remote-debugging-port=9222
-  Full programmatic control.
-
-MODE 2 — Native (pyautogui):
-  Chrome is just open normally, no debug port needed.
-  Controls Chrome via OS-level mouse/keyboard + screenshots.
-
-On startup, CDP is tried first. If it fails, Native mode kicks in automatically.
-Never opens a fresh Chromium. Never closes your existing Chrome.
+agent.py — LLM brain that interprets commands and calls browser tools.
+Supports: local Ollama · Anthropic · OpenAI · Google Gemini · OpenRouter · xAI
 """
 
+import json
+import re
 import asyncio
-import base64
-import io
-import socket
-import subprocess
-import time
-import os
-import pyautogui
-import pygetwindow as gw
-import pyperclip
-from playwright.async_api import async_playwright, Page, Browser, BrowserContext, Playwright
-
-# ── Globals ───────────────────────────────────────────────────────────────────
-_playwright: Playwright = None
-_browser: Browser = None
-_context: BrowserContext = None
-_page: Page = None
-
-MODE = "none"   # "cdp" | "native"
-
-DEBUG_PORT = 9222
-
-_CHROME_CANDIDATES = [
-    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
-]
-USER_DATA_DIR = os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\User Data")
-
-pyautogui.FAILSAFE = True
-pyautogui.PAUSE = 0.15
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _get_chrome_exe() -> str | None:
-    for path in _CHROME_CANDIDATES:
-        if os.path.exists(path):
-            return path
-    return None
-
-
-def _is_port_open(port: int = DEBUG_PORT) -> bool:
-    try:
-        with socket.create_connection(("localhost", port), timeout=1):
-            return True
-    except OSError:
-        return False
-
-
-def _find_chrome_window():
-    """Return the largest visible Chrome window, or None."""
-    for title_fragment in ["Google Chrome", "Chrome"]:
-        wins = [w for w in gw.getWindowsWithTitle(title_fragment) if w.visible]
-        if wins:
-            return max(wins, key=lambda w: w.width * w.height)
-    return None
-
-
-def _focus_chrome() -> bool:
-    """Bring Chrome to the foreground. Returns True if found."""
-    win = _find_chrome_window()
-    if not win:
-        return False
-    try:
-        win.activate()
-        time.sleep(0.35)
-    except Exception:
-        pass
-    return True
-
-
-def _chrome_rect():
-    """Return (left, top, width, height) of the Chrome window, or None."""
-    win = _find_chrome_window()
-    if win:
-        return win.left, win.top, win.width, win.height
-    return None
-
-
-# ── CDP path ──────────────────────────────────────────────────────────────────
-
-async def _try_cdp_connect(retries: int = 5) -> bool:
-    global _browser, _context, _page, MODE
-    for attempt in range(1, retries + 1):
-        try:
-            _browser = await _playwright.chromium.connect_over_cdp(
-                f"http://localhost:{DEBUG_PORT}"
-            )
-            contexts = _browser.contexts
-            _context = contexts[0] if contexts else await _browser.new_context()
-            pages = _context.pages
-            _page = pages[0] if pages else await _context.new_page()
-            MODE = "cdp"
-            return True
-        except Exception as e:
-            print(f"  CDP attempt {attempt}/{retries}: {e}")
-            if attempt < retries:
-                await asyncio.sleep(1.5)
-    return False
-
-
-# ── Startup / shutdown ────────────────────────────────────────────────────────
-
-async def start_browser(headless: bool = False) -> str:
-    """Returns active mode: 'cdp' or 'native'."""
-    global _playwright, MODE
-
-    _playwright = await async_playwright().start()
-
-    # Step 1: Debug port already open → CDP mode
-    if _is_port_open():
-        print("✓ Debug port open — connecting via CDP...")
-        if await _try_cdp_connect():
-            print(f"✓ CDP mode. Active tab: {_page.url}")
-            return MODE
-
-    # Step 2: No debug port → Native mode (Chrome stays untouched)
-    print("Debug port not open — using Native mode (your Chrome stays as-is).\n")
-
-    if not _find_chrome_window():
-        chrome = _get_chrome_exe()
-        if chrome:
-            print("  Chrome not running — launching it normally...")
-            subprocess.Popen(
-                [chrome, "--no-first-run", f"--user-data-dir={USER_DATA_DIR}"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            time.sleep(3)
-        else:
-            raise RuntimeError("Could not find chrome.exe. Check _CHROME_CANDIDATES in browser.py.")
-
-    if _find_chrome_window():
-        MODE = "native"
-        print("✓ Native mode — controlling Chrome via keyboard/mouse + screenshots.")
-        print("  Tip: run start_chrome.bat before the agent for full CDP mode.\n")
-        return MODE
-
-    raise RuntimeError("Could not find or open Chrome.")
-
-
-async def stop_browser():
-    global _playwright, _browser, _context, _page, MODE
-    # CDP: disconnect only — do NOT close the user's Chrome window
-    if MODE == "cdp":
-        for obj in [_context, _browser]:
-            if obj:
-                try:
-                    await obj.close()
-                except Exception:
-                    pass
-    if _playwright:
-        await _playwright.stop()
-    _page = _context = _browser = _playwright = None
-    MODE = "none"
-
-
-def get_mode() -> str:
-    return MODE
-
-
-# ── Tools ─────────────────────────────────────────────────────────────────────
-
-async def navigate(url: str) -> dict:
-    if not url.startswith("http"):
-        url = "https://" + url
-
-    if MODE == "cdp":
-        await _page.goto(url, wait_until="domcontentloaded", timeout=15000)
-        return {"status": "ok", "url": _page.url, "title": await _page.title()}
-
-    # Native: focus Chrome, open address bar, type, go
-    # IMPORTANT: we return the URL we navigated TO, not what's in the bar after load.
-    # Reading the address bar mid-load causes incorrect URLs and agent retry loops.
-    if not _focus_chrome():
-        return {"status": "error", "message": "Chrome window not found"}
-    pyautogui.hotkey("ctrl", "l")
-    time.sleep(0.3)
-    pyautogui.hotkey("ctrl", "a")
-    pyautogui.write(url, interval=0.03)
-    pyautogui.press("enter")
-    time.sleep(2.5)  # wait for page to load before returning
-    return {"status": "ok", "navigated_to": url, "note": "Page is loading. Use screenshot() to see the result."}
-
-
-async def click(selector: str = None, text: str = None,
-                x: int = None, y: int = None) -> dict:
-    if MODE == "cdp":
-        if text:
-            await _page.get_by_text(text, exact=False).first.click(timeout=8000)
-        elif selector:
-            await _page.click(selector, timeout=8000)
-        else:
-            return {"status": "error", "message": "Need selector or text"}
-        return {"status": "ok"}
-
-    # Native: MUST have x,y — no DOM access available
-    if not _focus_chrome():
-        return {"status": "error", "message": "Chrome window not found"}
-    if x is not None and y is not None:
-        pyautogui.click(x, y)
-        time.sleep(0.4)
-        return {"status": "ok", "clicked": f"({x}, {y})"}
-    return {
-        "status": "needs_coords",
-        "message": "Call screenshot() first to see the page, then call click(x=X, y=Y) with the coordinates."
-    }
-
-
-async def type_text(selector: str = None, text: str = "",
-                    clear_first: bool = True) -> dict:
-    if MODE == "cdp":
-        if selector and clear_first:
-            await _page.fill(selector, "")
-        if selector:
-            await _page.type(selector, text, delay=40)
-        return {"status": "ok"}
-
-    if not _focus_chrome():
-        return {"status": "error", "message": "Chrome window not found"}
-    if clear_first:
-        pyautogui.hotkey("ctrl", "a")
-    pyautogui.write(text, interval=0.04)
-    return {"status": "ok"}
-
-
-async def press_key(key: str) -> dict:
-    if MODE == "cdp":
-        await _page.keyboard.press(key)
-        return {"status": "ok"}
-
-    if not _focus_chrome():
-        return {"status": "error", "message": "Chrome window not found"}
-    _KEY_MAP = {
-        "Enter": "enter", "Tab": "tab", "Escape": "esc",
-        "Backspace": "backspace", "Delete": "delete",
-        "ArrowDown": "down", "ArrowUp": "up",
-        "ArrowLeft": "left", "ArrowRight": "right",
-        "Home": "home", "End": "end",
-        "PageDown": "pagedown", "PageUp": "pageup",
-    }
-    pyautogui.press(_KEY_MAP.get(key, key.lower()))
-    return {"status": "ok"}
-
-
-async def scroll(direction: str = "down", amount: int = 3) -> dict:
-    if MODE == "cdp":
-        delta = 300 * amount * (1 if direction == "down" else -1)
-        await _page.mouse.wheel(0, delta)
-        await asyncio.sleep(0.4)
-        return {"status": "ok"}
-
-    if not _focus_chrome():
-        return {"status": "error", "message": "Chrome window not found"}
-    pyautogui.scroll(-amount * 3 if direction == "down" else amount * 3)
-    return {"status": "ok"}
-
-
-async def scroll_to_bottom() -> dict:
-    if MODE == "cdp":
-        await _page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await asyncio.sleep(0.5)
-        return {"status": "ok"}
-
-    if not _focus_chrome():
-        return {"status": "error", "message": "Chrome window not found"}
-    pyautogui.hotkey("ctrl", "end")
-    return {"status": "ok"}
-
-
-async def get_page_text() -> dict:
-    if MODE == "cdp":
-        text = await _page.inner_text("body")
-        return {"status": "ok", "text": text[:6000]}
-
-    if not _focus_chrome():
-        return {"status": "error", "message": "Chrome window not found"}
-    pyperclip.copy("")
-    pyautogui.hotkey("ctrl", "a")
-    time.sleep(0.2)
-    pyautogui.hotkey("ctrl", "c")
-    time.sleep(0.4)
-    pyautogui.press("esc")
-    text = pyperclip.paste()
-    return {"status": "ok", "text": text[:6000]}
-
-
-async def get_page_url() -> dict:
-    if MODE == "cdp":
-        return {"status": "ok", "url": _page.url, "title": await _page.title()}
-
-    # Read address bar — only call this when explicitly needed, not after navigate()
-    if not _focus_chrome():
-        return {"status": "error", "message": "Chrome window not found"}
-    pyautogui.hotkey("ctrl", "l")
-    time.sleep(0.3)
-    pyperclip.copy("")
-    pyautogui.hotkey("ctrl", "c")
-    time.sleep(0.25)
-    url = pyperclip.paste().strip()
-    pyautogui.press("esc")
-    return {"status": "ok", "url": url}
-
-
-async def screenshot_base64() -> str:
-    """Take a screenshot of the Chrome window."""
-    if MODE == "cdp":
-        img_bytes = await _page.screenshot(type="png")
-        return base64.b64encode(img_bytes).decode("utf-8")
-
-    rect = _chrome_rect()
-    _focus_chrome()
-    time.sleep(0.2)
-    if rect:
-        left, top, width, height = rect
-        img = pyautogui.screenshot(region=(left, top, width, height))
-    else:
-        img = pyautogui.screenshot()
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
-
-
-async def search_web(query: str, engine: str = "google") -> dict:
-    engines = {
-        "google": f"https://www.google.com/search?q={query.replace(' ', '+')}",
-        "bing": f"https://www.bing.com/search?q={query.replace(' ', '+')}",
-        "duckduckgo": f"https://duckduckgo.com/?q={query.replace(' ', '+')}",
-    }
-    return await navigate(engines.get(engine, engines["google"]))
-
-
-async def open_new_tab(url: str = "about:blank") -> dict:
-    global _page
-    if MODE == "cdp":
-        _page = await _context.new_page()
-        if url != "about:blank":
-            await navigate(url)
-        return {"status": "ok", "message": "New tab opened"}
-
-    if not _focus_chrome():
-        return {"status": "error", "message": "Chrome window not found"}
-    pyautogui.hotkey("ctrl", "t")
-    time.sleep(0.5)
-    if url != "about:blank":
-        return await navigate(url)
-    return {"status": "ok", "message": "New tab opened"}
-
-
-async def close_tab() -> dict:
-    """Close the current tab."""
-    global _page
-    if MODE == "cdp":
-        try:
-            await _page.close()
-            # Move to the last remaining page
-            pages = _context.pages
-            if pages:
-                _page = pages[-1]
-                await _page.bring_to_front()
-                return {"status": "ok", "message": f"Tab closed. Now on: {_page.url}"}
-            else:
-                _page = await _context.new_page()
-                return {"status": "ok", "message": "Tab closed. Opened new blank tab."}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
-
-    if not _focus_chrome():
-        return {"status": "error", "message": "Chrome window not found"}
-    pyautogui.hotkey("ctrl", "w")
-    time.sleep(0.3)
-    return {"status": "ok", "message": "Tab closed"}
-
-
-async def go_back() -> dict:
-    if MODE == "cdp":
-        await _page.go_back()
-        return {"status": "ok"}
-
-    if not _focus_chrome():
-        return {"status": "error", "message": "Chrome window not found"}
-    pyautogui.hotkey("alt", "left")
-    return {"status": "ok"}
-
-
-async def go_forward() -> dict:
-    if MODE == "cdp":
-        await _page.go_forward()
-        return {"status": "ok"}
-
-    if not _focus_chrome():
-        return {"status": "error", "message": "Chrome window not found"}
-    pyautogui.hotkey("alt", "right")
-    return {"status": "ok"}
-
-
-# ── CDP-only tools ────────────────────────────────────────────────────────────
-
-async def wait_for_selector(selector: str, timeout: int = 5000) -> dict:
-    if MODE != "cdp":
-        return {"status": "error", "message": "CDP-only. Use screenshot() to check if something appeared."}
-    try:
-        await _page.wait_for_selector(selector, timeout=timeout)
-        return {"status": "ok", "found": True}
-    except Exception:
-        return {"status": "error", "found": False, "message": "Element not found in time"}
-
-
-async def get_links() -> dict:
-    if MODE != "cdp":
-        return {"status": "error", "message": "CDP-only. Use screenshot() to see links visually."}
-    links = await _page.evaluate("""
-        () => Array.from(document.querySelectorAll('a[href]'))
-            .slice(0, 30)
-            .map(a => ({ text: a.innerText.trim(), href: a.href }))
-            .filter(l => l.text.length > 0)
-    """)
-    return {"status": "ok", "links": links}
-
-
-# ── Tool registry ─────────────────────────────────────────────────────────────
-
-TOOLS = {
-    "navigate": navigate,
-    "click": click,
-    "type_text": type_text,
-    "press_key": press_key,
-    "scroll": scroll,
-    "scroll_to_bottom": scroll_to_bottom,
-    "get_page_text": get_page_text,
-    "get_page_url": get_page_url,
-    "search_web": search_web,
-    "open_new_tab": open_new_tab,
-    "close_tab": close_tab,
-    "go_back": go_back,
-    "go_forward": go_forward,
-    "wait_for_selector": wait_for_selector,
-    "get_links": get_links,
-    "screenshot": screenshot_base64,
+import httpx
+from config import load_config
+from browser import TOOLS, TOOL_DESCRIPTIONS
+
+# OpenAI-compatible endpoints — same payload format, different base URL
+_OPENAI_COMPAT_URLS = {
+    "openai":      "https://api.openai.com/v1/chat/completions",
+    "gemini":      "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    "openrouter":  "https://openrouter.ai/api/v1/chat/completions",
+    "xai":         "https://api.x.ai/v1/chat/completions",
 }
 
-TOOL_DESCRIPTIONS = """
-You have these browser tools. Call them with JSON: {"tool": "navigate", "args": {"url": "https://youtube.com"}}
+# Keep only the N most recent history messages to avoid blowing the context
+# window on smaller local models (e.g. 3B / 4B).
+_MAX_HISTORY = 20
 
-ALWAYS AVAILABLE (CDP + Native):
-- navigate(url)                        Go to a URL. Returns immediately — page may still be loading.
-- click(selector?, text?, x?, y?)      CDP: by selector/text. Native: MUST provide x,y pixel coords.
-- type_text(text, selector?, clear?)   Type text. Native: click the field first, then type.
-- press_key(key)                       Enter, Tab, Escape, ArrowDown, ArrowUp, etc.
-- scroll(direction, amount?)           "up" or "down"
-- scroll_to_bottom()                   Jump to page bottom
-- get_page_text()                      Get visible text on page
-- get_page_url()                       Get current URL
-- search_web(query, engine?)           Google/Bing/DuckDuckGo search
-- open_new_tab(url?)                   Open a new tab
-- close_tab()                          Close the current tab (Ctrl+W)
-- go_back()                            Navigate back
-- go_forward()                         Navigate forward
-- screenshot()                         Take a screenshot of Chrome (ALWAYS use this in Native mode to see the page)
+SYSTEM_PROMPT = f"""You are a browser control agent. The user gives you tasks \
+and you complete them by controlling a real web browser step by step.
 
-CDP MODE ONLY:
-- wait_for_selector(selector, ms?)     Wait for an element
-- get_links()                          Get all links on page
+{TOOL_DESCRIPTIONS}
 
-CRITICAL RULES:
-1. After navigate() succeeds, the task of "opening" that site IS DONE. Do NOT navigate again.
-2. In Native mode, NEVER use selector or text with click() — always use x,y coordinates.
-3. To click something in Native mode: call screenshot() first, identify the element's position, then call click(x=X, y=Y).
-4. If navigate() returns status "ok", trust it. Do NOT call get_page_url() to double-check — this disrupts loading.
-5. Only call screenshot() when you need to SEE the page. Do not take screenshots unnecessarily.
+RULES:
+- Output ONLY ONE ```json ... ``` block per response — never two or more.
+- After each tool result, decide your next step.
+- When the task is fully done respond with plain text only (no JSON).
+- If something fails, try an alternative before giving up.
+- Prefer clicking by visible text over CSS selectors — sites change selectors often.
+- Keep reasoning short, be direct.
+
+EXAMPLE:
+User: open youtube and search for lofi music
+```json
+{{"tool": "navigate", "args": {{"url": "https://youtube.com"}}}}
+```
+[result]
+```json
+{{"tool": "click", "args": {{"text": "Search"}}}}
+```
+[result]
+```json
+{{"tool": "type_text", "args": {{"selector": "input#search", "text": "lofi music"}}}}
+```
+[result]
+```json
+{{"tool": "press_key", "args": {{"key": "Enter"}}}}
+```
+Done — searched YouTube for lofi music.
 """
+
+
+# ── Helpers ────────────────────────────────────────────────
+
+def _trim_history(history: list) -> list:
+    """Keep only the most recent messages so small models don't OOM."""
+    if len(history) <= _MAX_HISTORY:
+        return history
+    return history[-_MAX_HISTORY:]
+
+
+def _extract_tool_call(text: str) -> dict | None:
+    """Pull a JSON tool call out of the model's response."""
+    # Primary: ```json { ... } ```
+    match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Fallback: raw JSON with a "tool" key anywhere in text
+    match = re.search(r'\{\s*"tool"\s*:.+?\}', text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
+async def _call_tool(tool_call: dict) -> tuple[str, str | None]:
+    """
+    Execute a browser tool.
+    Returns (text_result, screenshot_b64_or_None).
+    The b64 is only set when the screenshot tool ran successfully.
+    """
+    tool_name = tool_call.get("tool")
+    args = tool_call.get("args", {})
+
+    if tool_name not in TOOLS:
+        return f"Unknown tool: {tool_name}", None
+
+    try:
+        result = await TOOLS[tool_name](**args)
+    except Exception as e:
+        return f"Tool error: {str(e)}", None
+
+    # Screenshot tool returns {"status": "ok", "base64": "..."}
+    if tool_name == "screenshot":
+        b64 = result.get("base64", "")
+        return "[screenshot captured]", (b64 if b64 else None)
+
+    return json.dumps(result), None
+
+
+# ── Vision message builders ────────────────────────────────
+
+def _inject_vision_anthropic(messages: list, b64: str) -> list:
+    """Inject a screenshot into the last message using Anthropic's image format."""
+    messages = list(messages)
+    last = messages[-1]
+    messages[-1] = {
+        "role": last["role"],
+        "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
+            {"type": "text", "text": last.get("content", "")},
+        ],
+    }
+    return messages
+
+
+def _inject_vision_openai(messages: list, b64: str) -> list:
+    """Inject a screenshot into the last message using OpenAI's image_url format."""
+    messages = list(messages)
+    last = messages[-1]
+    messages[-1] = {
+        "role": last["role"],
+        "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+            {"type": "text", "text": last.get("content", "")},
+        ],
+    }
+    return messages
+
+
+# ── Model callers ──────────────────────────────────────────
+
+async def _call_ollama(model: str, history: list, pending_b64: str | None) -> str:
+    import ollama
+    client = ollama.AsyncClient()
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + _trim_history(history)
+
+    # Ollama vision: add "images" field to the last message
+    if pending_b64:
+        last = messages[-1]
+        messages[-1] = {**last, "images": [pending_b64]}
+
+    response = await client.chat(model=model, messages=messages)
+    return response["message"]["content"]
+
+
+async def _call_anthropic(key: str, model: str, history: list, pending_b64: str | None) -> str:
+    messages = list(_trim_history(history))
+    if pending_b64:
+        messages = _inject_vision_anthropic(messages, pending_b64)
+
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "max_tokens": 1024,
+                "system": SYSTEM_PROMPT,
+                "messages": messages,
+            },
+            timeout=30,
+        )
+    data = r.json()
+    if "content" not in data:
+        raise RuntimeError(f"Anthropic API error: {data}")
+    content = data["content"][0]
+    return content.get("text", str(content))
+
+
+async def _call_openai_compat(
+    provider: str, key: str, model: str, history: list, pending_b64: str | None
+) -> str:
+    """Handles openai / gemini / openrouter / xai — all share the same payload format."""
+    url = _OPENAI_COMPAT_URLS[provider]
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + list(_trim_history(history))
+
+    if pending_b64:
+        messages = _inject_vision_openai(messages, pending_b64)
+
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    if provider == "openrouter":
+        headers["HTTP-Referer"] = "https://github.com/kingxxasavan/Broswer-Agent"
+
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            url,
+            headers=headers,
+            json={"model": model, "messages": messages},
+            timeout=30,
+        )
+    data = r.json()
+    if "choices" not in data:
+        raise RuntimeError(f"{provider} API error: {data}")
+    return data["choices"][0]["message"]["content"]
+
+
+# ── Main agent loop ────────────────────────────────────────
+
+async def run_agent_turn(
+    user_message: str,
+    history: list,
+    status_cb=None,
+) -> tuple[str, list]:
+    """
+    Run one user turn through the ReAct loop.
+    Returns (final_reply, updated_history).
+    status_cb(msg) is called so the TUI spinner stays updated.
+    """
+    cfg = load_config()
+    history = history + [{"role": "user", "content": user_message}]
+
+    max_steps      = cfg.get("max_steps", 15)
+    vision_enabled = cfg.get("vision_enabled", False)
+    mode           = cfg.get("mode", "local")
+    provider       = cfg.get("api_provider", "anthropic")
+
+    final_reply = ""
+    pending_b64: str | None = None   # screenshot waiting to be sent to model
+
+    for step in range(max_steps):
+        if status_cb:
+            status_cb(f"thinking... (step {step + 1})")
+
+        b64_to_send = pending_b64 if vision_enabled else None
+        pending_b64 = None   # clear before call so we don't re-send on failure
+
+        # ── Call the right model ───────────────────────────
+        try:
+            if mode == "local":
+                reply_text = await _call_ollama(cfg["local_model"], history, b64_to_send)
+
+            elif provider == "anthropic":
+                reply_text = await _call_anthropic(
+                    cfg["api_key"], cfg["api_model"], history, b64_to_send
+                )
+
+            elif provider in _OPENAI_COMPAT_URLS:
+                reply_text = await _call_openai_compat(
+                    provider, cfg["api_key"], cfg["api_model"], history, b64_to_send
+                )
+
+            else:
+                reply_text = f"[error] Unknown provider '{provider}'"
+
+        except Exception as e:
+            reply_text = f"[model error: {e}]"
+
+        history.append({"role": "assistant", "content": reply_text})
+
+        # ── Check for tool call ────────────────────────────
+        tool_call = _extract_tool_call(reply_text)
+        if tool_call:
+            tool_name = tool_call.get("tool", "?")
+            if status_cb:
+                status_cb(f"running: {tool_name}({tool_call.get('args', {})})")
+
+            tool_text, screenshot_b64 = await _call_tool(tool_call)
+
+            if screenshot_b64 and vision_enabled:
+                pending_b64 = screenshot_b64   # inject on next LLM call
+
+            history.append({"role": "user", "content": f"[tool result]: {tool_text}"})
+
+        else:
+            # No JSON block → agent considers the task done
+            final_reply = reply_text.strip()
+            break
+
+    else:
+        final_reply = "Reached max steps without completing the task."
+
+    return final_reply, history
