@@ -1,4 +1,7 @@
-ollama
 playwright
+ollama
 rich
-httpx
+pyautogui
+pygetwindow
+pyperclip
+Pillow
