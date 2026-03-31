@@ -1,0 +1,4 @@
+ollama
+playwright
+rich
+httpx
