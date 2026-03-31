@@ -1,182 +1,339 @@
 """
-browser.py — Playwright browser control layer
-Auto connects to running Chrome or relaunches it with debug port.
+browser.py — Dual-mode browser control
+
+MODE 1 — CDP (Playwright):
+  Chrome was launched with --remote-debugging-port=9222
+  Full programmatic control.
+
+MODE 2 — Native (pyautogui):
+  Chrome is just open normally, no debug port needed.
+  Controls Chrome via OS-level mouse/keyboard + screenshots.
+
+On startup, CDP is tried first. If it fails, Native mode kicks in automatically.
+Never opens a fresh Chromium. Never closes your existing Chrome.
 """
 
 import asyncio
 import base64
+import io
 import socket
 import subprocess
 import time
 import os
-from playwright.async_api import async_playwright, Page, Browser, BrowserContext
+import pyautogui
+import pygetwindow as gw
+import pyperclip
+from playwright.async_api import async_playwright, Page, Browser, BrowserContext, Playwright
 
-_playwright = None
+# ── Globals ───────────────────────────────────────────────────────────────────
+_playwright: Playwright = None
 _browser: Browser = None
 _context: BrowserContext = None
 _page: Page = None
 
+MODE = "none"   # "cdp" | "native"
+
 DEBUG_PORT = 9222
-CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+
+_CHROME_CANDIDATES = [
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+]
+USER_DATA_DIR = os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\User Data")
+
+pyautogui.FAILSAFE = True
+pyautogui.PAUSE = 0.15
 
 
-def _is_debug_port_open() -> bool:
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _get_chrome_exe() -> str | None:
+    for path in _CHROME_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _is_port_open(port: int = DEBUG_PORT) -> bool:
     try:
-        with socket.create_connection(("localhost", DEBUG_PORT), timeout=1):
+        with socket.create_connection(("localhost", port), timeout=1):
             return True
     except OSError:
         return False
 
 
-def _kill_and_relaunch_chrome():
-    """Blocking: kill Chrome and relaunch with debug port. Run in executor."""
-    user_data_dir = os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\User Data")
+def _find_chrome_window():
+    """Return the largest visible Chrome window, or None."""
+    for title_fragment in ["Google Chrome", "Chrome"]:
+        wins = [w for w in gw.getWindowsWithTitle(title_fragment) if w.visible]
+        if wins:
+            return max(wins, key=lambda w: w.width * w.height)
+    return None
 
-    # Kill existing Chrome
-    subprocess.run(
-        ["taskkill", "/F", "/IM", "chrome.exe"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-    time.sleep(2)
 
-    # Relaunch with debug port
-    subprocess.Popen([
-        CHROME_PATH,
-        f"--remote-debugging-port={DEBUG_PORT}",
-        f"--user-data-dir={user_data_dir}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--restore-last-session",
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def _focus_chrome() -> bool:
+    """Bring Chrome to the foreground. Returns True if found."""
+    win = _find_chrome_window()
+    if not win:
+        return False
+    try:
+        win.activate()
+        time.sleep(0.35)
+    except Exception:
+        pass
+    return True
 
-    # Wait for port to open (up to 10 seconds)
-    for _ in range(20):
-        if _is_debug_port_open():
+
+def _chrome_rect():
+    """Return (left, top, width, height) of the Chrome window, or None."""
+    win = _find_chrome_window()
+    if win:
+        return win.left, win.top, win.width, win.height
+    return None
+
+
+# ── CDP path ──────────────────────────────────────────────────────────────────
+
+async def _try_cdp_connect(retries: int = 5) -> bool:
+    global _browser, _context, _page, MODE
+    for attempt in range(1, retries + 1):
+        try:
+            _browser = await _playwright.chromium.connect_over_cdp(
+                f"http://localhost:{DEBUG_PORT}"
+            )
+            contexts = _browser.contexts
+            _context = contexts[0] if contexts else await _browser.new_context()
+            pages = _context.pages
+            _page = pages[0] if pages else await _context.new_page()
+            MODE = "cdp"
             return True
-        time.sleep(0.5)
-
+        except Exception as e:
+            print(f"  CDP attempt {attempt}/{retries}: {e}")
+            if attempt < retries:
+                await asyncio.sleep(1.5)
     return False
 
 
-async def start_browser(headless: bool = False):
-    global _playwright, _browser, _context, _page
+# ── Startup / shutdown ────────────────────────────────────────────────────────
+
+async def start_browser(headless: bool = False) -> str:
+    """Returns active mode: 'cdp' or 'native'."""
+    global _playwright, MODE
 
     _playwright = await async_playwright().start()
 
-    if not _is_debug_port_open():
-        print("Chrome not in debug mode. Relaunching...")
-        # Run the blocking kill+relaunch in a thread so asyncio doesn't freeze
-        loop = asyncio.get_event_loop()
-        ready = await loop.run_in_executor(None, _kill_and_relaunch_chrome)
-        if not ready:
-            print("Chrome launch timed out. Falling back to fresh browser...")
-            _browser = await _playwright.chromium.launch(headless=headless)
-            _context = await _browser.new_context(viewport={"width": 1280, "height": 800})
-            _page = await _context.new_page()
-            return _page
-        print("Chrome ready, connecting...")
-    else:
-        print("Connecting to existing Chrome...")
+    # Step 1: Debug port already open → CDP mode
+    if _is_port_open():
+        print("✓ Debug port open — connecting via CDP...")
+        if await _try_cdp_connect():
+            print(f"✓ CDP mode. Active tab: {_page.url}")
+            return MODE
 
-    try:
-        _browser = await _playwright.chromium.connect_over_cdp(f"http://localhost:{DEBUG_PORT}")
-        contexts = _browser.contexts
-        _context = contexts[0] if contexts else await _browser.new_context()
-        pages = _context.pages
-        _page = pages[0] if pages else await _context.new_page()
-    except Exception as e:
-        print(f"CDP connect failed: {e}\nFalling back to fresh browser...")
-        _browser = await _playwright.chromium.launch(headless=headless)
-        _context = await _browser.new_context(viewport={"width": 1280, "height": 800})
-        _page = await _context.new_page()
+    # Step 2: No debug port → Native mode (Chrome stays untouched)
+    print("Debug port not open — using Native mode (your Chrome stays as-is).\n")
 
-    return _page
+    if not _find_chrome_window():
+        chrome = _get_chrome_exe()
+        if chrome:
+            print("  Chrome not running — launching it normally...")
+            subprocess.Popen(
+                [chrome, "--no-first-run", f"--user-data-dir={USER_DATA_DIR}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            time.sleep(3)
+        else:
+            raise RuntimeError("Could not find chrome.exe. Check _CHROME_CANDIDATES in browser.py.")
+
+    if _find_chrome_window():
+        MODE = "native"
+        print("✓ Native mode — controlling Chrome via keyboard/mouse + screenshots.")
+        print("  Tip: run start_chrome.bat before the agent for full CDP mode.\n")
+        return MODE
+
+    raise RuntimeError("Could not find or open Chrome.")
 
 
 async def stop_browser():
-    global _playwright, _context, _browser
-    for obj in [_context, _browser]:
-        if obj:
-            try:
-                await obj.close()
-            except Exception:
-                pass
+    global _playwright, _browser, _context, _page, MODE
+    # CDP: disconnect only — do NOT close the user's Chrome window
+    if MODE == "cdp":
+        for obj in [_context, _browser]:
+            if obj:
+                try:
+                    await obj.close()
+                except Exception:
+                    pass
     if _playwright:
         await _playwright.stop()
+    _page = _context = _browser = _playwright = None
+    MODE = "none"
 
 
-async def get_page() -> Page:
-    if _page is None:
-        raise RuntimeError("Browser not started.")
-    return _page
+def get_mode() -> str:
+    return MODE
 
+
+# ── Tools ─────────────────────────────────────────────────────────────────────
 
 async def navigate(url: str) -> dict:
-    page = await get_page()
     if not url.startswith("http"):
         url = "https://" + url
-    await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-    return {"status": "ok", "url": page.url, "title": await page.title()}
+
+    if MODE == "cdp":
+        await _page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        return {"status": "ok", "url": _page.url, "title": await _page.title()}
+
+    # Native: focus Chrome, open address bar, type, go
+    # IMPORTANT: we return the URL we navigated TO, not what's in the bar after load.
+    # Reading the address bar mid-load causes incorrect URLs and agent retry loops.
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    pyautogui.hotkey("ctrl", "l")
+    time.sleep(0.3)
+    pyautogui.hotkey("ctrl", "a")
+    pyautogui.write(url, interval=0.03)
+    pyautogui.press("enter")
+    time.sleep(2.5)  # wait for page to load before returning
+    return {"status": "ok", "navigated_to": url, "note": "Page is loading. Use screenshot() to see the result."}
 
 
-async def click(selector: str = None, text: str = None) -> dict:
-    page = await get_page()
-    if text:
-        await page.get_by_text(text, exact=False).first.click(timeout=8000)
-    elif selector:
-        await page.click(selector, timeout=8000)
-    else:
-        return {"status": "error", "message": "Need selector or text"}
-    return {"status": "ok"}
+async def click(selector: str = None, text: str = None,
+                x: int = None, y: int = None) -> dict:
+    if MODE == "cdp":
+        if text:
+            await _page.get_by_text(text, exact=False).first.click(timeout=8000)
+        elif selector:
+            await _page.click(selector, timeout=8000)
+        else:
+            return {"status": "error", "message": "Need selector or text"}
+        return {"status": "ok"}
+
+    # Native: MUST have x,y — no DOM access available
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    if x is not None and y is not None:
+        pyautogui.click(x, y)
+        time.sleep(0.4)
+        return {"status": "ok", "clicked": f"({x}, {y})"}
+    return {
+        "status": "needs_coords",
+        "message": "Call screenshot() first to see the page, then call click(x=X, y=Y) with the coordinates."
+    }
 
 
-async def type_text(selector: str, text: str, clear_first: bool = True) -> dict:
-    page = await get_page()
+async def type_text(selector: str = None, text: str = "",
+                    clear_first: bool = True) -> dict:
+    if MODE == "cdp":
+        if selector and clear_first:
+            await _page.fill(selector, "")
+        if selector:
+            await _page.type(selector, text, delay=40)
+        return {"status": "ok"}
+
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
     if clear_first:
-        await page.fill(selector, "")
-    await page.type(selector, text, delay=40)
+        pyautogui.hotkey("ctrl", "a")
+    pyautogui.write(text, interval=0.04)
     return {"status": "ok"}
 
 
 async def press_key(key: str) -> dict:
-    page = await get_page()
-    await page.keyboard.press(key)
+    if MODE == "cdp":
+        await _page.keyboard.press(key)
+        return {"status": "ok"}
+
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    _KEY_MAP = {
+        "Enter": "enter", "Tab": "tab", "Escape": "esc",
+        "Backspace": "backspace", "Delete": "delete",
+        "ArrowDown": "down", "ArrowUp": "up",
+        "ArrowLeft": "left", "ArrowRight": "right",
+        "Home": "home", "End": "end",
+        "PageDown": "pagedown", "PageUp": "pageup",
+    }
+    pyautogui.press(_KEY_MAP.get(key, key.lower()))
     return {"status": "ok"}
 
 
 async def scroll(direction: str = "down", amount: int = 3) -> dict:
-    page = await get_page()
-    delta = 300 * amount
-    if direction == "up":
-        delta = -delta
-    await page.mouse.wheel(0, delta)
-    await asyncio.sleep(0.4)
+    if MODE == "cdp":
+        delta = 300 * amount * (1 if direction == "down" else -1)
+        await _page.mouse.wheel(0, delta)
+        await asyncio.sleep(0.4)
+        return {"status": "ok"}
+
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    pyautogui.scroll(-amount * 3 if direction == "down" else amount * 3)
     return {"status": "ok"}
 
 
 async def scroll_to_bottom() -> dict:
-    page = await get_page()
-    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    await asyncio.sleep(0.5)
+    if MODE == "cdp":
+        await _page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await asyncio.sleep(0.5)
+        return {"status": "ok"}
+
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    pyautogui.hotkey("ctrl", "end")
     return {"status": "ok"}
 
 
 async def get_page_text() -> dict:
-    page = await get_page()
-    text = await page.inner_text("body")
+    if MODE == "cdp":
+        text = await _page.inner_text("body")
+        return {"status": "ok", "text": text[:6000]}
+
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    pyperclip.copy("")
+    pyautogui.hotkey("ctrl", "a")
+    time.sleep(0.2)
+    pyautogui.hotkey("ctrl", "c")
+    time.sleep(0.4)
+    pyautogui.press("esc")
+    text = pyperclip.paste()
     return {"status": "ok", "text": text[:6000]}
 
 
 async def get_page_url() -> dict:
-    page = await get_page()
-    return {"status": "ok", "url": page.url, "title": await page.title()}
+    if MODE == "cdp":
+        return {"status": "ok", "url": _page.url, "title": await _page.title()}
+
+    # Read address bar — only call this when explicitly needed, not after navigate()
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    pyautogui.hotkey("ctrl", "l")
+    time.sleep(0.3)
+    pyperclip.copy("")
+    pyautogui.hotkey("ctrl", "c")
+    time.sleep(0.25)
+    url = pyperclip.paste().strip()
+    pyautogui.press("esc")
+    return {"status": "ok", "url": url}
 
 
 async def screenshot_base64() -> str:
-    page = await get_page()
-    img_bytes = await page.screenshot(type="png")
-    return base64.b64encode(img_bytes).decode("utf-8")
+    """Take a screenshot of the Chrome window."""
+    if MODE == "cdp":
+        img_bytes = await _page.screenshot(type="png")
+        return base64.b64encode(img_bytes).decode("utf-8")
+
+    rect = _chrome_rect()
+    _focus_chrome()
+    time.sleep(0.2)
+    if rect:
+        left, top, width, height = rect
+        img = pyautogui.screenshot(region=(left, top, width, height))
+    else:
+        img = pyautogui.screenshot()
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 async def search_web(query: str, engine: str = "google") -> dict:
@@ -190,30 +347,84 @@ async def search_web(query: str, engine: str = "google") -> dict:
 
 async def open_new_tab(url: str = "about:blank") -> dict:
     global _page
-    _page = await _context.new_page()
+    if MODE == "cdp":
+        _page = await _context.new_page()
+        if url != "about:blank":
+            await navigate(url)
+        return {"status": "ok", "message": "New tab opened"}
+
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    pyautogui.hotkey("ctrl", "t")
+    time.sleep(0.5)
     if url != "about:blank":
-        await navigate(url)
+        return await navigate(url)
     return {"status": "ok", "message": "New tab opened"}
 
 
+async def close_tab() -> dict:
+    """Close the current tab."""
+    global _page
+    if MODE == "cdp":
+        try:
+            await _page.close()
+            # Move to the last remaining page
+            pages = _context.pages
+            if pages:
+                _page = pages[-1]
+                await _page.bring_to_front()
+                return {"status": "ok", "message": f"Tab closed. Now on: {_page.url}"}
+            else:
+                _page = await _context.new_page()
+                return {"status": "ok", "message": "Tab closed. Opened new blank tab."}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    pyautogui.hotkey("ctrl", "w")
+    time.sleep(0.3)
+    return {"status": "ok", "message": "Tab closed"}
+
+
 async def go_back() -> dict:
-    page = await get_page()
-    await page.go_back()
+    if MODE == "cdp":
+        await _page.go_back()
+        return {"status": "ok"}
+
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    pyautogui.hotkey("alt", "left")
     return {"status": "ok"}
 
 
+async def go_forward() -> dict:
+    if MODE == "cdp":
+        await _page.go_forward()
+        return {"status": "ok"}
+
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    pyautogui.hotkey("alt", "right")
+    return {"status": "ok"}
+
+
+# ── CDP-only tools ────────────────────────────────────────────────────────────
+
 async def wait_for_selector(selector: str, timeout: int = 5000) -> dict:
-    page = await get_page()
+    if MODE != "cdp":
+        return {"status": "error", "message": "CDP-only. Use screenshot() to check if something appeared."}
     try:
-        await page.wait_for_selector(selector, timeout=timeout)
+        await _page.wait_for_selector(selector, timeout=timeout)
         return {"status": "ok", "found": True}
     except Exception:
         return {"status": "error", "found": False, "message": "Element not found in time"}
 
 
 async def get_links() -> dict:
-    page = await get_page()
-    links = await page.evaluate("""
+    if MODE != "cdp":
+        return {"status": "error", "message": "CDP-only. Use screenshot() to see links visually."}
+    links = await _page.evaluate("""
         () => Array.from(document.querySelectorAll('a[href]'))
             .slice(0, 30)
             .map(a => ({ text: a.innerText.trim(), href: a.href }))
@@ -221,6 +432,8 @@ async def get_links() -> dict:
     """)
     return {"status": "ok", "links": links}
 
+
+# ── Tool registry ─────────────────────────────────────────────────────────────
 
 TOOLS = {
     "navigate": navigate,
@@ -233,27 +446,41 @@ TOOLS = {
     "get_page_url": get_page_url,
     "search_web": search_web,
     "open_new_tab": open_new_tab,
+    "close_tab": close_tab,
     "go_back": go_back,
+    "go_forward": go_forward,
     "wait_for_selector": wait_for_selector,
     "get_links": get_links,
     "screenshot": screenshot_base64,
 }
 
 TOOL_DESCRIPTIONS = """
-You have these browser tools available. Call them using JSON like: {"tool": "navigate", "args": {"url": "https://youtube.com"}}
+You have these browser tools. Call them with JSON: {"tool": "navigate", "args": {"url": "https://youtube.com"}}
 
-- navigate(url): Go to a URL
-- click(selector?, text?): Click an element by CSS selector or by visible text
-- type_text(selector, text, clear_first?): Type into an input field
-- press_key(key): Press a key like Enter, Tab, Escape
-- scroll(direction, amount?): Scroll "up" or "down" by amount steps
-- scroll_to_bottom(): Scroll to the very bottom of the page
-- get_page_text(): Get visible text on the current page
-- get_page_url(): Get current URL and title
-- search_web(query, engine?): Search Google/Bing/DuckDuckGo
-- open_new_tab(url?): Open a new browser tab
-- go_back(): Go back in browser history
-- wait_for_selector(selector, timeout?): Wait for an element to appear
-- get_links(): Get clickable links on current page
-- screenshot(): Take a screenshot (use when you need to see the page)
+ALWAYS AVAILABLE (CDP + Native):
+- navigate(url)                        Go to a URL. Returns immediately — page may still be loading.
+- click(selector?, text?, x?, y?)      CDP: by selector/text. Native: MUST provide x,y pixel coords.
+- type_text(text, selector?, clear?)   Type text. Native: click the field first, then type.
+- press_key(key)                       Enter, Tab, Escape, ArrowDown, ArrowUp, etc.
+- scroll(direction, amount?)           "up" or "down"
+- scroll_to_bottom()                   Jump to page bottom
+- get_page_text()                      Get visible text on page
+- get_page_url()                       Get current URL
+- search_web(query, engine?)           Google/Bing/DuckDuckGo search
+- open_new_tab(url?)                   Open a new tab
+- close_tab()                          Close the current tab (Ctrl+W)
+- go_back()                            Navigate back
+- go_forward()                         Navigate forward
+- screenshot()                         Take a screenshot of Chrome (ALWAYS use this in Native mode to see the page)
+
+CDP MODE ONLY:
+- wait_for_selector(selector, ms?)     Wait for an element
+- get_links()                          Get all links on page
+
+CRITICAL RULES:
+1. After navigate() succeeds, the task of "opening" that site IS DONE. Do NOT navigate again.
+2. In Native mode, NEVER use selector or text with click() — always use x,y coordinates.
+3. To click something in Native mode: call screenshot() first, identify the element's position, then call click(x=X, y=Y).
+4. If navigate() returns status "ok", trust it. Do NOT call get_page_url() to double-check — this disrupts loading.
+5. Only call screenshot() when you need to SEE the page. Do not take screenshots unnecessarily.
 """
