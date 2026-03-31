@@ -1,451 +1,486 @@
 """
-agent.py — LLM brain with fast-path router
+browser.py — Dual-mode browser control
 
-Simple commands are handled instantly with zero LLM calls.
-Only genuinely complex tasks hit the model.
+MODE 1 — CDP (Playwright):
+  Chrome was launched with --remote-debugging-port=9222
+  Full programmatic control.
 
-Fast path covers:
-  - Open/go to a known site or any URL
-  - New tab, close tab, go back, go forward
-  - Scroll up/down
-  - Fullscreen, press key shortcuts
-  - Search on a specific site
-  - Refresh page
+MODE 2 — Native (pyautogui):
+  Chrome is just open normally, no debug port needed.
+  Controls Chrome via OS-level mouse/keyboard + screenshots.
 
-Everything else falls through to the LLM agent loop.
+On startup, CDP is tried first. If it fails, Native mode kicks in automatically.
+Never opens a fresh Chromium. Never closes your existing Chrome.
 """
 
-import json
-import re
 import asyncio
-from config import load_config
-from browser import TOOLS, TOOL_DESCRIPTIONS, get_mode
+import base64
+import io
+import socket
+import subprocess
+import time
+import os
+import pyautogui
+import pygetwindow as gw
+import pyperclip
+from playwright.async_api import async_playwright, Page, Browser, BrowserContext, Playwright
 
-# ── Known sites ───────────────────────────────────────────────────────────────
-# Add any site you use frequently here.
-KNOWN_SITES: dict[str, str] = {
-    "youtube":      "https://www.youtube.com",
-    "google":       "https://www.google.com",
-    "gmail":        "https://mail.google.com",
-    "github":       "https://www.github.com",
-    "reddit":       "https://www.reddit.com",
-    "twitter":      "https://www.twitter.com",
-    "x":            "https://www.x.com",
-    "instagram":    "https://www.instagram.com",
-    "netflix":      "https://www.netflix.com",
-    "spotify":      "https://open.spotify.com",
-    "discord":      "https://discord.com/app",
-    "canvas":       "https://canvas.instructure.com",
-    "duolingo":     "https://www.duolingo.com",
-    "wikipedia":    "https://www.wikipedia.org",
-    "amazon":       "https://www.amazon.com",
-    "chatgpt":      "https://chatgpt.com",
-    "claude":       "https://claude.ai",
-    "notion":       "https://www.notion.so",
-    "stackoverflow": "https://stackoverflow.com",
-}
+# ── Globals ───────────────────────────────────────────────────────────────────
+_playwright: Playwright = None
+_browser: Browser = None
+_context: BrowserContext = None
+_page: Page = None
 
-# Search engine templates
-SEARCH_ENGINES: dict[str, str] = {
-    "google":     "https://www.google.com/search?q={}",
-    "youtube":    "https://www.youtube.com/results?search_query={}",
-    "reddit":     "https://www.reddit.com/search/?q={}",
-    "github":     "https://github.com/search?q={}",
-    "amazon":     "https://www.amazon.com/s?k={}",
-    "wikipedia":  "https://en.wikipedia.org/w/index.php?search={}",
-    "bing":       "https://www.bing.com/search?q={}",
-    "duckduckgo": "https://duckduckgo.com/?q={}",
-}
+MODE = "none"   # "cdp" | "native"
+
+DEBUG_PORT = 9222
+
+_CHROME_CANDIDATES = [
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+]
+USER_DATA_DIR = os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\User Data")
+
+pyautogui.FAILSAFE = True
+pyautogui.PAUSE = 0.15
 
 
-# ── Fast-path router ──────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _normalize(text: str) -> str:
-    return text.lower().strip()
-
-
-async def try_fast_path(msg: str) -> str | None:
-    """
-    Try to handle the message with zero LLM calls.
-    Returns a reply string if handled, None if it should go to the LLM.
-    """
-    m = _normalize(msg)
-
-    # ── URL typed directly ────────────────────────────────────────────────────
-    # e.g. "youtube.com" or "https://github.com/kingxxasavan"
-    url_match = re.match(
-        r'^(https?://\S+|[\w-]+\.(com|org|net|io|dev|ai|edu|gov|co|app|gg|tv|me)(/\S*)?)$',
-        m
-    )
-    if url_match:
-        url = m if m.startswith("http") else "https://" + m
-        result = await TOOLS["navigate"](url=url)
-        return f"Opened {url}"
-
-    # ── "open/go to <site>" ───────────────────────────────────────────────────
-    open_match = re.match(
-        r'^(?:open|go to|navigate to|launch|load|take me to|visit)\s+(.+)$', m
-    )
-    if open_match:
-        target = open_match.group(1).strip().rstrip(".")
-        # Check known sites first
-        url = _resolve_site(target)
-        if url:
-            await TOOLS["navigate"](url=url)
-            return f"Opened {target.title()} → {url}"
-        # Looks like a raw URL
-        if re.search(r'\.\w{2,}', target):
-            url = target if target.startswith("http") else "https://" + target
-            await TOOLS["navigate"](url=url)
-            return f"Navigated to {url}"
-        # Can't resolve — fall through to LLM
-        return None
-
-    # ── "search <query>" or "search for <query>" (defaults to Google) ─────────
-    search_match = re.match(r'^search(?:\s+for)?\s+(.+)$', m)
-    if search_match:
-        query = search_match.group(1).strip()
-        # Strip trailing "on google/youtube/etc"
-        on_match = re.search(r'\s+on\s+(\w+)$', query)
-        if on_match:
-            site = on_match.group(1)
-            query = query[:on_match.start()].strip()
-            url = _build_search_url(site, query)
-        else:
-            url = _build_search_url("google", query)
-        await TOOLS["navigate"](url=url)
-        return f"Searched for \"{query}\""
-
-    # ── "search <query> on <site>" ────────────────────────────────────────────
-    search_on_match = re.match(r'^(?:search|look up|find)\s+(.+?)\s+on\s+(\w+)$', m)
-    if search_on_match:
-        query = search_on_match.group(1).strip()
-        site  = search_on_match.group(2).strip()
-        url = _build_search_url(site, query)
-        await TOOLS["navigate"](url=url)
-        return f"Searched {site.title()} for \"{query}\""
-
-    # ── Tab management ────────────────────────────────────────────────────────
-    if re.match(r'^(new tab|open new tab|open a new tab)$', m):
-        await TOOLS["open_new_tab"]()
-        return "Opened a new tab"
-
-    if re.match(r'^(new tab\s+)?open\s+(.+)\s+in\s+(a\s+)?new\s+tab$', m):
-        inner = re.match(r'^(?:new tab\s+)?open\s+(.+)\s+in\s+(?:a\s+)?new\s+tab$', m)
-        if inner:
-            target = inner.group(1).strip()
-            url = _resolve_site(target) or ("https://" + target if "." in target else None)
-            if url:
-                await TOOLS["open_new_tab"](url=url)
-                return f"Opened {target.title()} in a new tab"
-
-    if re.match(r'^(close tab|close this tab|close current tab)$', m):
-        result = await TOOLS["close_tab"]()
-        return result.get("message", "Tab closed")
-
-    # ── Navigation ────────────────────────────────────────────────────────────
-    if re.match(r'^(go back|back|previous page)$', m):
-        await TOOLS["go_back"]()
-        return "Went back"
-
-    if re.match(r'^(go forward|forward|next page)$', m):
-        await TOOLS["go_forward"]()
-        return "Went forward"
-
-    if re.match(r'^(refresh|reload|refresh page|reload page)$', m):
-        await TOOLS["press_key"](key="F5")
-        return "Page refreshed"
-
-    # ── Scrolling ─────────────────────────────────────────────────────────────
-    scroll_match = re.match(r'^scroll\s*(down|up)(?:\s+(\d+))?$', m)
-    if scroll_match:
-        direction = scroll_match.group(1)
-        amount = int(scroll_match.group(2)) if scroll_match.group(2) else 3
-        await TOOLS["scroll"](direction=direction, amount=amount)
-        return f"Scrolled {direction}"
-
-    if re.match(r'^(scroll to bottom|jump to bottom|end of page)$', m):
-        await TOOLS["scroll_to_bottom"]()
-        return "Scrolled to bottom"
-
-    if re.match(r'^(scroll to top|jump to top|top of page)$', m):
-        await TOOLS["press_key"](key="ctrl+Home")
-        return "Scrolled to top"
-
-    # ── Keyboard shortcuts ────────────────────────────────────────────────────
-    if re.match(r'^(fullscreen|full screen|fullscreen mode|theater mode)$', m):
-        await TOOLS["press_key"](key="f")   # YouTube/Netflix fullscreen
-        return "Toggled fullscreen (pressed F)"
-
-    if re.match(r'^(exit fullscreen|leave fullscreen)$', m):
-        await TOOLS["press_key"](key="Escape")
-        return "Exited fullscreen"
-
-    if re.match(r'^(pause|play|pause\s*/\s*play|toggle play)$', m):
-        await TOOLS["press_key"](key="k")   # YouTube/Netflix space or k
-        return "Toggled play/pause"
-
-    if re.match(r'^(mute|unmute|toggle mute)$', m):
-        await TOOLS["press_key"](key="m")
-        return "Toggled mute"
-
-    if re.match(r'^press\s+(.+)$', m):
-        key_raw = re.match(r'^press\s+(.+)$', m).group(1).strip()
-        key = _map_key(key_raw)
-        await TOOLS["press_key"](key=key)
-        return f"Pressed {key_raw}"
-
-    # ── Nothing matched — let the LLM handle it ───────────────────────────────
+def _get_chrome_exe() -> str | None:
+    for path in _CHROME_CANDIDATES:
+        if os.path.exists(path):
+            return path
     return None
 
 
-def _resolve_site(name: str) -> str | None:
-    """Return URL for a known site name, or None."""
-    name = name.lower().strip()
-    if name in KNOWN_SITES:
-        return KNOWN_SITES[name]
-    # Partial match — e.g. "youtubes" won't match, but "you tube" won't either
-    for key, url in KNOWN_SITES.items():
-        if name == key:
-            return url
-    return None
-
-
-def _build_search_url(site: str, query: str) -> str:
-    site = site.lower()
-    encoded = query.replace(" ", "+")
-    if site in SEARCH_ENGINES:
-        return SEARCH_ENGINES[site].format(encoded)
-    # Unknown site — fall back to Google
-    return SEARCH_ENGINES["google"].format(encoded)
-
-
-def _map_key(raw: str) -> str:
-    mapping = {
-        "enter": "Enter", "return": "Enter",
-        "escape": "Escape", "esc": "Escape",
-        "tab": "Tab", "space": "Space",
-        "backspace": "Backspace", "delete": "Delete",
-        "up": "ArrowUp", "down": "ArrowDown",
-        "left": "ArrowLeft", "right": "ArrowRight",
-        "f5": "F5", "f11": "F11", "f": "f",
-        "k": "k", "m": "m",
-    }
-    return mapping.get(raw.lower(), raw)
-
-
-# ── System prompt ─────────────────────────────────────────────────────────────
-
-def _build_system_prompt() -> str:
-    mode = get_mode()
-
-    if mode == "native":
-        example = """\
-EXAMPLE (Native mode):
-
-User: find the search bar on youtube and type lofi music
-You: ```json
-{"tool": "screenshot", "args": {}}
-```
-[screenshot taken — search bar visible at roughly x=720, y=65]
-```json
-{"tool": "click", "args": {"x": 720, "y": 65}}
-```
-[result: {"status": "ok"}]
-```json
-{"tool": "type_text", "args": {"text": "lofi music"}}
-```
-[result: {"status": "ok"}]
-```json
-{"tool": "press_key", "args": {"key": "Enter"}}
-```
-Done — typed lofi music into the YouTube search bar and hit Enter."""
-    else:
-        example = """\
-EXAMPLE (CDP mode):
-
-User: find the trending videos section on youtube
-You: ```json
-{"tool": "navigate", "args": {"url": "https://www.youtube.com/feed/trending"}}
-```
-[result: {"status": "ok", "url": "https://www.youtube.com/feed/trending"}]
-Done — opened YouTube Trending."""
-
-    return f"""You are a browser control agent. Complete tasks step by step.
-
-Current mode: {mode.upper()}
-
-{TOOL_DESCRIPTIONS}
-
-RULES:
-- Output ONE tool call at a time in a ```json ... ``` block
-- After each result, decide the next step
-- When done, respond in plain text (no JSON)
-- Never repeat the exact same tool call twice — if it failed, try differently
-- "needs_coords" means call screenshot() first, then click(x=Y, y=Y)
-
-{example}
-"""
-
-
-# ── LLM helpers ───────────────────────────────────────────────────────────────
-
-def _get_ollama_client(cfg: dict):
-    import ollama
-    if cfg["mode"] == "ollama_cloud":
-        return ollama.AsyncClient(
-            host=cfg["ollama_cloud_url"],
-            headers={"Authorization": f"Bearer {cfg['ollama_cloud_key']}"}
-        )
-    return ollama.AsyncClient()
-
-
-def _get_model_name(cfg: dict) -> str:
-    if cfg["mode"] == "local":      return cfg["local_model"]
-    if cfg["mode"] == "ollama_cloud": return cfg["ollama_cloud_model"]
-    return cfg["api_model"]
-
-
-def _extract_tool_call(text: str) -> dict | None:
-    match = re.search(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if match:
-        try: return json.loads(match.group(1))
-        except json.JSONDecodeError: pass
-    match = re.search(r'\{\s*"tool"\s*:.+?\}', text, re.DOTALL)
-    if match:
-        try: return json.loads(match.group(0))
-        except json.JSONDecodeError: pass
-    return None
-
-
-def _tool_key(tool_call: dict) -> str:
-    return json.dumps(tool_call, sort_keys=True)
-
-
-async def _run_tool(tool_call: dict) -> str:
-    name = tool_call.get("tool")
-    args = tool_call.get("args", {})
-    if name not in TOOLS:
-        return f"Unknown tool: {name}"
+def _is_port_open(port: int = DEBUG_PORT) -> bool:
     try:
-        result = await TOOLS[name](**args)
-        if isinstance(result, str):
-            return "[screenshot taken]" if len(result) > 100 else result
-        return json.dumps(result)
-    except Exception as e:
-        return f"Tool error: {e}"
+        with socket.create_connection(("localhost", port), timeout=1):
+            return True
+    except OSError:
+        return False
 
 
-# ── Main entry point ──────────────────────────────────────────────────────────
+def _find_chrome_window():
+    """Return the largest visible Chrome window, or None."""
+    for title_fragment in ["Google Chrome", "Chrome"]:
+        wins = [w for w in gw.getWindowsWithTitle(title_fragment) if w.visible]
+        if wins:
+            return max(wins, key=lambda w: w.width * w.height)
+    return None
 
-async def run_agent_turn(
-    user_message: str,
-    history: list,
-    status_cb=None,
-) -> tuple[str, list]:
-    """
-    Run one user turn. Fast path first, LLM loop only if needed.
-    Returns (reply, updated_history).
-    """
 
-    # ── Fast path — no LLM, no waiting ───────────────────────────────────────
-    if status_cb:
-        status_cb("routing...")
+def _focus_chrome() -> bool:
+    """Bring Chrome to the foreground. Returns True if found."""
+    win = _find_chrome_window()
+    if not win:
+        return False
+    try:
+        win.activate()
+        time.sleep(0.35)
+    except Exception:
+        pass
+    return True
 
-    fast_reply = await try_fast_path(user_message)
-    if fast_reply is not None:
-        # Update history so the LLM has context for follow-up questions
-        history = history + [
-            {"role": "user",      "content": user_message},
-            {"role": "assistant", "content": fast_reply},
-        ]
-        return fast_reply, history
 
-    # ── LLM path — complex tasks ──────────────────────────────────────────────
-    if status_cb:
-        status_cb("thinking...")
+def _chrome_rect():
+    """Return (left, top, width, height) of the Chrome window, or None."""
+    win = _find_chrome_window()
+    if win:
+        return win.left, win.top, win.width, win.height
+    return None
 
-    cfg = load_config()
-    history = history + [{"role": "user", "content": user_message}]
-    system_prompt = _build_system_prompt()
-    max_steps = 12
-    final_reply = ""
-    last_keys: list[str] = []
 
-    for step in range(max_steps):
-        if status_cb:
-            status_cb(f"thinking... (step {step + 1})")
+# ── CDP path ──────────────────────────────────────────────────────────────────
 
-        # Call model
-        if cfg["mode"] in ("local", "ollama_cloud"):
-            client = _get_ollama_client(cfg)
-            model  = _get_model_name(cfg)
-            resp = await client.chat(
-                model=model,
-                messages=[{"role": "system", "content": system_prompt}] + history,
+async def _try_cdp_connect(retries: int = 5) -> bool:
+    global _browser, _context, _page, MODE
+    for attempt in range(1, retries + 1):
+        try:
+            _browser = await _playwright.chromium.connect_over_cdp(
+                f"http://localhost:{DEBUG_PORT}"
             )
-            reply_text = resp["message"]["content"]
-        elif cfg["mode"] == "api":
-            reply_text = await _call_api_model(cfg, history, system_prompt)
+            contexts = _browser.contexts
+            _context = contexts[0] if contexts else await _browser.new_context()
+            pages = _context.pages
+            _page = pages[0] if pages else await _context.new_page()
+            MODE = "cdp"
+            return True
+        except Exception as e:
+            print(f"  CDP attempt {attempt}/{retries}: {e}")
+            if attempt < retries:
+                await asyncio.sleep(1.5)
+    return False
+
+
+# ── Startup / shutdown ────────────────────────────────────────────────────────
+
+async def start_browser(headless: bool = False) -> str:
+    """Returns active mode: 'cdp' or 'native'."""
+    global _playwright, MODE
+
+    _playwright = await async_playwright().start()
+
+    # Step 1: Debug port already open → CDP mode
+    if _is_port_open():
+        print("✓ Debug port open — connecting via CDP...")
+        if await _try_cdp_connect():
+            print(f"✓ CDP mode. Active tab: {_page.url}")
+            return MODE
+
+    # Step 2: No debug port → Native mode (Chrome stays untouched)
+    print("Debug port not open — using Native mode (your Chrome stays as-is).\n")
+
+    if not _find_chrome_window():
+        chrome = _get_chrome_exe()
+        if chrome:
+            print("  Chrome not running — launching it normally...")
+            subprocess.Popen(
+                [chrome, "--no-first-run", f"--user-data-dir={USER_DATA_DIR}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            time.sleep(3)
         else:
-            reply_text = "Unknown mode in config."
+            raise RuntimeError("Could not find chrome.exe. Check _CHROME_CANDIDATES in browser.py.")
 
-        history.append({"role": "assistant", "content": reply_text})
+    if _find_chrome_window():
+        MODE = "native"
+        print("✓ Native mode — controlling Chrome via keyboard/mouse + screenshots.")
+        print("  Tip: run start_chrome.bat before the agent for full CDP mode.\n")
+        return MODE
 
-        tool_call = _extract_tool_call(reply_text)
-        if not tool_call:
-            final_reply = reply_text.strip()
-            break
+    raise RuntimeError("Could not find or open Chrome.")
 
-        # Loop guard
-        key = _tool_key(tool_call)
-        if len(last_keys) >= 2 and all(k == key for k in last_keys[-2:]):
-            final_reply = (
-                f"Stopped to avoid a loop — "
-                f"{tool_call.get('tool')} was called 3 times with identical args. "
-                "Try rephrasing your request."
-            )
-            break
-        last_keys.append(key)
 
-        if status_cb:
-            preview = str(tool_call.get("args", {}))[:80]
-            status_cb(f"{tool_call.get('tool')}({preview})")
+async def stop_browser():
+    global _playwright, _browser, _context, _page, MODE
+    # CDP: disconnect only — do NOT close the user's Chrome window
+    if MODE == "cdp":
+        for obj in [_context, _browser]:
+            if obj:
+                try:
+                    await obj.close()
+                except Exception:
+                    pass
+    if _playwright:
+        await _playwright.stop()
+    _page = _context = _browser = _playwright = None
+    MODE = "none"
 
-        tool_result = await _run_tool(tool_call)
-        history.append({"role": "user", "content": f"[tool result]: {tool_result}"})
 
+def get_mode() -> str:
+    return MODE
+
+
+# ── Tools ─────────────────────────────────────────────────────────────────────
+
+async def navigate(url: str) -> dict:
+    if not url.startswith("http"):
+        url = "https://" + url
+
+    if MODE == "cdp":
+        await _page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        return {"status": "ok", "url": _page.url, "title": await _page.title()}
+
+    # Native: focus Chrome, open address bar, type, go
+    # IMPORTANT: we return the URL we navigated TO, not what's in the bar after load.
+    # Reading the address bar mid-load causes incorrect URLs and agent retry loops.
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    pyautogui.hotkey("ctrl", "l")
+    time.sleep(0.3)
+    pyautogui.hotkey("ctrl", "a")
+    pyautogui.write(url, interval=0.03)
+    pyautogui.press("enter")
+    time.sleep(2.5)  # wait for page to load before returning
+    return {"status": "ok", "navigated_to": url, "note": "Page is loading. Use screenshot() to see the result."}
+
+
+async def click(selector: str = None, text: str = None,
+                x: int = None, y: int = None) -> dict:
+    if MODE == "cdp":
+        if text:
+            await _page.get_by_text(text, exact=False).first.click(timeout=8000)
+        elif selector:
+            await _page.click(selector, timeout=8000)
+        else:
+            return {"status": "error", "message": "Need selector or text"}
+        return {"status": "ok"}
+
+    # Native: MUST have x,y — no DOM access available
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    if x is not None and y is not None:
+        pyautogui.click(x, y)
+        time.sleep(0.4)
+        return {"status": "ok", "clicked": f"({x}, {y})"}
+    return {
+        "status": "needs_coords",
+        "message": "Call screenshot() first to see the page, then call click(x=X, y=Y) with the coordinates."
+    }
+
+
+async def type_text(selector: str = None, text: str = "",
+                    clear_first: bool = True) -> dict:
+    if MODE == "cdp":
+        if selector and clear_first:
+            await _page.fill(selector, "")
+        if selector:
+            await _page.type(selector, text, delay=40)
+        return {"status": "ok"}
+
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    if clear_first:
+        pyautogui.hotkey("ctrl", "a")
+    pyautogui.write(text, interval=0.04)
+    return {"status": "ok"}
+
+
+async def press_key(key: str) -> dict:
+    if MODE == "cdp":
+        await _page.keyboard.press(key)
+        return {"status": "ok"}
+
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    _KEY_MAP = {
+        "Enter": "enter", "Tab": "tab", "Escape": "esc",
+        "Backspace": "backspace", "Delete": "delete",
+        "ArrowDown": "down", "ArrowUp": "up",
+        "ArrowLeft": "left", "ArrowRight": "right",
+        "Home": "home", "End": "end",
+        "PageDown": "pagedown", "PageUp": "pageup",
+    }
+    pyautogui.press(_KEY_MAP.get(key, key.lower()))
+    return {"status": "ok"}
+
+
+async def scroll(direction: str = "down", amount: int = 3) -> dict:
+    if MODE == "cdp":
+        delta = 300 * amount * (1 if direction == "down" else -1)
+        await _page.mouse.wheel(0, delta)
+        await asyncio.sleep(0.4)
+        return {"status": "ok"}
+
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    pyautogui.scroll(-amount * 3 if direction == "down" else amount * 3)
+    return {"status": "ok"}
+
+
+async def scroll_to_bottom() -> dict:
+    if MODE == "cdp":
+        await _page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await asyncio.sleep(0.5)
+        return {"status": "ok"}
+
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    pyautogui.hotkey("ctrl", "end")
+    return {"status": "ok"}
+
+
+async def get_page_text() -> dict:
+    if MODE == "cdp":
+        text = await _page.inner_text("body")
+        return {"status": "ok", "text": text[:6000]}
+
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    pyperclip.copy("")
+    pyautogui.hotkey("ctrl", "a")
+    time.sleep(0.2)
+    pyautogui.hotkey("ctrl", "c")
+    time.sleep(0.4)
+    pyautogui.press("esc")
+    text = pyperclip.paste()
+    return {"status": "ok", "text": text[:6000]}
+
+
+async def get_page_url() -> dict:
+    if MODE == "cdp":
+        return {"status": "ok", "url": _page.url, "title": await _page.title()}
+
+    # Read address bar — only call this when explicitly needed, not after navigate()
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    pyautogui.hotkey("ctrl", "l")
+    time.sleep(0.3)
+    pyperclip.copy("")
+    pyautogui.hotkey("ctrl", "c")
+    time.sleep(0.25)
+    url = pyperclip.paste().strip()
+    pyautogui.press("esc")
+    return {"status": "ok", "url": url}
+
+
+async def screenshot_base64() -> str:
+    """Take a screenshot of the Chrome window."""
+    if MODE == "cdp":
+        img_bytes = await _page.screenshot(type="png")
+        return base64.b64encode(img_bytes).decode("utf-8")
+
+    rect = _chrome_rect()
+    _focus_chrome()
+    time.sleep(0.2)
+    if rect:
+        left, top, width, height = rect
+        img = pyautogui.screenshot(region=(left, top, width, height))
     else:
-        final_reply = "Reached max steps without completing the task."
+        img = pyautogui.screenshot()
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-    return final_reply, history
+
+async def search_web(query: str, engine: str = "google") -> dict:
+    engines = {
+        "google": f"https://www.google.com/search?q={query.replace(' ', '+')}",
+        "bing": f"https://www.bing.com/search?q={query.replace(' ', '+')}",
+        "duckduckgo": f"https://duckduckgo.com/?q={query.replace(' ', '+')}",
+    }
+    return await navigate(engines.get(engine, engines["google"]))
 
 
-async def _call_api_model(cfg: dict, history: list, system_prompt: str) -> str:
-    provider = cfg.get("api_provider", "openai")
-    key      = cfg.get("api_key", "")
-    model    = cfg.get("api_model", "gpt-4o")
+async def open_new_tab(url: str = "about:blank") -> dict:
+    global _page
+    if MODE == "cdp":
+        _page = await _context.new_page()
+        if url != "about:blank":
+            await navigate(url)
+        return {"status": "ok", "message": "New tab opened"}
 
-    if provider == "openai":
-        import httpx
-        async with httpx.AsyncClient() as c:
-            r = await c.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={"model": model, "messages": [{"role": "system", "content": system_prompt}] + history},
-                timeout=30,
-            )
-            return r.json()["choices"][0]["message"]["content"]
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    pyautogui.hotkey("ctrl", "t")
+    time.sleep(0.5)
+    if url != "about:blank":
+        return await navigate(url)
+    return {"status": "ok", "message": "New tab opened"}
 
-    if provider == "anthropic":
-        import httpx
-        async with httpx.AsyncClient() as c:
-            r = await c.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
-                json={"model": model, "max_tokens": 1024, "system": system_prompt, "messages": history},
-                timeout=30,
-            )
-            return r.json()["content"][0]["text"]
 
-    return "API provider not supported."
+async def close_tab() -> dict:
+    """Close the current tab."""
+    global _page
+    if MODE == "cdp":
+        try:
+            await _page.close()
+            # Move to the last remaining page
+            pages = _context.pages
+            if pages:
+                _page = pages[-1]
+                await _page.bring_to_front()
+                return {"status": "ok", "message": f"Tab closed. Now on: {_page.url}"}
+            else:
+                _page = await _context.new_page()
+                return {"status": "ok", "message": "Tab closed. Opened new blank tab."}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    pyautogui.hotkey("ctrl", "w")
+    time.sleep(0.3)
+    return {"status": "ok", "message": "Tab closed"}
+
+
+async def go_back() -> dict:
+    if MODE == "cdp":
+        await _page.go_back()
+        return {"status": "ok"}
+
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    pyautogui.hotkey("alt", "left")
+    return {"status": "ok"}
+
+
+async def go_forward() -> dict:
+    if MODE == "cdp":
+        await _page.go_forward()
+        return {"status": "ok"}
+
+    if not _focus_chrome():
+        return {"status": "error", "message": "Chrome window not found"}
+    pyautogui.hotkey("alt", "right")
+    return {"status": "ok"}
+
+
+# ── CDP-only tools ────────────────────────────────────────────────────────────
+
+async def wait_for_selector(selector: str, timeout: int = 5000) -> dict:
+    if MODE != "cdp":
+        return {"status": "error", "message": "CDP-only. Use screenshot() to check if something appeared."}
+    try:
+        await _page.wait_for_selector(selector, timeout=timeout)
+        return {"status": "ok", "found": True}
+    except Exception:
+        return {"status": "error", "found": False, "message": "Element not found in time"}
+
+
+async def get_links() -> dict:
+    if MODE != "cdp":
+        return {"status": "error", "message": "CDP-only. Use screenshot() to see links visually."}
+    links = await _page.evaluate("""
+        () => Array.from(document.querySelectorAll('a[href]'))
+            .slice(0, 30)
+            .map(a => ({ text: a.innerText.trim(), href: a.href }))
+            .filter(l => l.text.length > 0)
+    """)
+    return {"status": "ok", "links": links}
+
+
+# ── Tool registry ─────────────────────────────────────────────────────────────
+
+TOOLS = {
+    "navigate": navigate,
+    "click": click,
+    "type_text": type_text,
+    "press_key": press_key,
+    "scroll": scroll,
+    "scroll_to_bottom": scroll_to_bottom,
+    "get_page_text": get_page_text,
+    "get_page_url": get_page_url,
+    "search_web": search_web,
+    "open_new_tab": open_new_tab,
+    "close_tab": close_tab,
+    "go_back": go_back,
+    "go_forward": go_forward,
+    "wait_for_selector": wait_for_selector,
+    "get_links": get_links,
+    "screenshot": screenshot_base64,
+}
+
+TOOL_DESCRIPTIONS = """
+You have these browser tools. Call them with JSON: {"tool": "navigate", "args": {"url": "https://youtube.com"}}
+
+ALWAYS AVAILABLE (CDP + Native):
+- navigate(url)                        Go to a URL. Returns immediately — page may still be loading.
+- click(selector?, text?, x?, y?)      CDP: by selector/text. Native: MUST provide x,y pixel coords.
+- type_text(text, selector?, clear?)   Type text. Native: click the field first, then type.
+- press_key(key)                       Enter, Tab, Escape, ArrowDown, ArrowUp, etc.
+- scroll(direction, amount?)           "up" or "down"
+- scroll_to_bottom()                   Jump to page bottom
+- get_page_text()                      Get visible text on page
+- get_page_url()                       Get current URL
+- search_web(query, engine?)           Google/Bing/DuckDuckGo search
+- open_new_tab(url?)                   Open a new tab
+- close_tab()                          Close the current tab (Ctrl+W)
+- go_back()                            Navigate back
+- go_forward()                         Navigate forward
+- screenshot()                         Take a screenshot of Chrome (ALWAYS use this in Native mode to see the page)
+
+CDP MODE ONLY:
+- wait_for_selector(selector, ms?)     Wait for an element
+- get_links()                          Get all links on page
+
+CRITICAL RULES:
+1. After navigate() succeeds, the task of "opening" that site IS DONE. Do NOT navigate again.
+2. In Native mode, NEVER use selector or text with click() — always use x,y coordinates.
+3. To click something in Native mode: call screenshot() first, identify the element's position, then call click(x=X, y=Y).
+4. If navigate() returns status "ok", trust it. Do NOT call get_page_url() to double-check — this disrupts loading.
+5. Only call screenshot() when you need to SEE the page. Do not take screenshots unnecessarily.
+"""
