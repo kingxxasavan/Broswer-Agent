@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Browser Agent</title>
+    <link rel="stylesheet" href="panel.css" />
+  </head>
+  <body>
+    <header class="bar">
+      <span class="brand">Browser Agent</span>
+      <span class="status" id="status" hidden>working…</span>
+      <button class="icon" id="clear" title="Clear conversation" type="button">Clear</button>
+      <button class="icon" id="settings" title="Settings" type="button">Settings</button>
+    </header>
+
+    <main id="log" class="log" aria-live="polite">
+      <div class="empty" id="empty">
+        <h1>Tell me what to do in this tab.</h1>
+        <ul>
+          <li>“Find the pricing page and tell me the cheapest paid plan.”</li>
+          <li>“Search this site for annual reports and download the 2024 PDF.”</li>
+          <li>“Log in is already done — open my orders and list what shipped.”</li>
+        </ul>
+        <p class="hint">I can read pages, click, type, scroll, switch tabs and download files.</p>
+      </div>
+    </main>
+
+    <div class="approval" id="approval" hidden>
+      <div class="approval-body">
+        <strong>Approve this action?</strong>
+        <code id="approval-detail"></code>
+      </div>
+      <div class="approval-actions">
+        <button id="approve" class="primary" type="button">Allow</button>
+        <button id="deny" type="button">Skip</button>
+      </div>
+    </div>
+
+    <form class="composer" id="composer">
+      <textarea
+        id="input"
+        rows="2"
+        placeholder="What should I do? (Enter to send, Shift+Enter for a new line)"
+      ></textarea>
+      <button id="send" class="primary" type="submit">Send</button>
+      <button id="stop" type="button" hidden>Stop</button>
+    </form>
+
+    <script type="module" src="panel.js"></script>
+  </body>
+</html>

@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Browser Agent — Settings</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Browser Agent</h1>
+      <p class="lede">
+        Pick the AI that drives your browser. Your API key is stored locally in this browser profile and is sent only
+        to the provider you choose.
+      </p>
+
+      <form id="form">
+        <section>
+          <h2>Model</h2>
+
+          <label for="provider">Provider</label>
+          <select id="provider"></select>
+
+          <label for="apiKey">API key</label>
+          <input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-…" />
+          <p class="help" id="keyHelp"></p>
+
+          <label for="model">Model</label>
+          <input id="model" list="modelOptions" spellcheck="false" />
+          <datalist id="modelOptions"></datalist>
+          <p class="help" id="modelHelp"></p>
+
+          <div id="baseUrlRow">
+            <label for="baseUrl" id="baseUrlLabel">API base URL</label>
+            <input id="baseUrl" spellcheck="false" placeholder="https://api.example.com/v1" />
+            <p class="help" id="baseUrlHelp"></p>
+          </div>
+
+          <div id="effortRow">
+            <label for="effort">Effort</label>
+            <select id="effort">
+              <option value="low">Low — fastest, cheapest</option>
+              <option value="medium">Medium</option>
+              <option value="high">High — recommended</option>
+              <option value="xhigh">Extra high</option>
+              <option value="max">Max — slowest, most thorough</option>
+            </select>
+            <p class="help">How hard Claude thinks before each action.</p>
+          </div>
+        </section>
+
+        <section>
+          <h2>Behaviour</h2>
+
+          <label for="maxSteps">Step limit per request</label>
+          <input id="maxSteps" type="number" min="1" max="100" />
+          <p class="help">How many actions the agent may take before it stops and checks in.</p>
+
+          <label class="check"><input id="confirmActions" type="checkbox" /> Ask me before every action</label>
+          <p class="help">Each click, keystroke and download waits for your approval in the side panel.</p>
+
+          <label class="check"><input id="askWhereToSave" type="checkbox" /> Ask where to save downloads</label>
+          <p class="help">Otherwise files go straight to your Downloads folder.</p>
+
+          <label class="check"><input id="vision" type="checkbox" /> Let the agent take screenshots</label>
+          <p class="help">
+            Useful for pages it cannot read as text. Screenshots of the visible tab are sent to your provider, so leave
+            this off unless you need it.
+          </p>
+        </section>
+
+        <section>
+          <h2>Blocked sites</h2>
+          <label for="blockedHosts">The agent will refuse to act on these</label>
+          <textarea id="blockedHosts" rows="4" spellcheck="false" placeholder="mybank.com&#10;admin.internal.example"></textarea>
+          <p class="help">One hostname per line. Subdomains are covered too.</p>
+        </section>
+
+        <div class="actions">
+          <button class="primary" type="submit">Save</button>
+          <span class="saved" id="saved" hidden>Saved</span>
+        </div>
+      </form>
+
+      <section class="danger">
+        <h2>Reading the page</h2>
+        <p class="help">
+          The agent reads text and links from whatever tab it is working in and sends that to your AI provider. It
+          cannot see <code>chrome://</code> pages or the Chrome Web Store — Chrome blocks extensions there.
+        </p>
+      </section>
+    </main>
+
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

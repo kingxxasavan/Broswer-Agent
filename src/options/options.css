@@ -1,0 +1,156 @@
+:root {
+  --bg: #ffffff;
+  --panel: #f6f5f2;
+  --border: #e4e1da;
+  --text: #1f1e1c;
+  --muted: #6d6a63;
+  --accent: #c1552c;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #191816;
+    --panel: #232120;
+    --border: #35322f;
+    --text: #eceae5;
+    --muted: #a19c93;
+    --accent: #e08159;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+main {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 40px 24px 64px;
+}
+
+h1 {
+  font-size: 24px;
+  margin: 0 0 6px;
+  letter-spacing: -0.02em;
+}
+
+h2 {
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 0 0 14px;
+}
+
+.lede {
+  color: var(--muted);
+  margin: 0 0 28px;
+}
+
+section {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 20px;
+  margin-bottom: 18px;
+}
+
+label {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  margin: 14px 0 5px;
+}
+
+section > label:first-of-type {
+  margin-top: 0;
+}
+
+label.check {
+  font-weight: 400;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+input,
+select,
+textarea {
+  width: 100%;
+  font: inherit;
+  font-size: 14px;
+  color: inherit;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+}
+
+textarea {
+  resize: vertical;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.help {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 5px 0 0;
+}
+
+.help a {
+  color: var(--accent);
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9em;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+button {
+  font: inherit;
+  font-size: 14px;
+  border-radius: 8px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  padding: 8px 18px;
+  cursor: pointer;
+}
+
+button:hover {
+  filter: brightness(1.06);
+}
+
+.saved {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+[hidden] {
+  display: none !important;
+}

@@ -1,0 +1,20 @@
+{
+  "name": "browser-agent-extension",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Chrome extension that lets an AI drive your browser: navigate, click, type, extract and download.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "smoke": "node tools/smoke-test.mjs",
+    "icons": "python3 tools/make_icons.py"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "playwright": "^1.62.1"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.116.0"
+  }
+}

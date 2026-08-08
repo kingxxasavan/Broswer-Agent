@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "Browser Agent",
+  "version": "1.0.0",
+  "description": "Give an AI the keys to your browser: it reads pages, clicks, types, switches tabs and downloads files for you.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "tabs",
+    "scripting",
+    "storage",
+    "downloads",
+    "sidePanel",
+    "webNavigation",
+    "contextMenus"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "dist/background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Open Browser Agent",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "side_panel": {
+    "default_path": "src/sidepanel/panel.html"
+  },
+  "options_page": "src/options/options.html",
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*", "file://*/*"],
+      "all_frames": true,
+      "js": ["src/content/content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
